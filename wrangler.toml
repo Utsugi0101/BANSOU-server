@@ -1,0 +1,13 @@
+name = "bansou-server"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+# Public values can live here.
+ISSUER = "https://attest.example.com"
+ATTEST_PUBLIC_JWK = '{"kty":"OKP","crv":"Ed25519","x":"...","kid":"bansou-key-1"}'
+# Optional policy JSON
+POLICY_JSON = "{}"
+
+# Store ATTEST_PRIVATE_JWK as a secret:
+#   wrangler secret put ATTEST_PRIVATE_JWK

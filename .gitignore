@@ -1,0 +1,28 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+
+# Env files
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# Build / cache
+/dist/
+/.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Coverage
+coverage/
