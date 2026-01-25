@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { importJWK, SignJWT } from "jose";
+import type { JWK } from "jose";
 
 interface Env {
   ISSUER: string;
@@ -34,6 +35,12 @@ const attestationSchema = z.object({
   answers_hash: z.string().optional()
 });
 
+function isJwk(value: unknown): value is JWK {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.kty === "string";
+}
+
 function jsonError(c: any, status: number, code: string, message: string) {
   return c.json({ error: code, error_description: message }, status);
 }
@@ -41,9 +48,13 @@ function jsonError(c: any, status: number, code: string, message: string) {
 app.get("/.well-known/jwks.json", (c) => {
   const raw = c.env.ATTEST_PUBLIC_JWK;
   if (!raw) return jsonError(c, 500, "server_error", "ATTEST_PUBLIC_JWK is missing");
-  let jwk: Record<string, unknown>;
+  let jwk: JWK;
   try {
-    jwk = JSON.parse(raw) as Record<string, unknown>;
+    const parsed = JSON.parse(raw);
+    if (!isJwk(parsed)) {
+      return jsonError(c, 500, "server_error", "ATTEST_PUBLIC_JWK is missing required fields");
+    }
+    jwk = parsed;
   } catch {
     return jsonError(c, 500, "server_error", "ATTEST_PUBLIC_JWK is invalid JSON");
   }
@@ -90,9 +101,13 @@ app.post("/attestations/issue", async (c) => {
   const privateJwkRaw = c.env.ATTEST_PRIVATE_JWK;
   if (!privateJwkRaw) return jsonError(c, 500, "server_error", "ATTEST_PRIVATE_JWK is missing");
 
-  let privateJwk: Record<string, unknown>;
+  let privateJwk: JWK;
   try {
-    privateJwk = JSON.parse(privateJwkRaw) as Record<string, unknown>;
+    const parsed = JSON.parse(privateJwkRaw);
+    if (!isJwk(parsed)) {
+      return jsonError(c, 500, "server_error", "ATTEST_PRIVATE_JWK is missing required fields");
+    }
+    privateJwk = parsed;
   } catch {
     return jsonError(c, 500, "server_error", "ATTEST_PRIVATE_JWK is invalid JSON");
   }
