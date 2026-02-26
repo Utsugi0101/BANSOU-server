@@ -11,3 +11,8 @@ POLICY_JSON = "{}"
 
 # Store ATTEST_PRIVATE_JWK as a secret:
 #   wrangler secret put ATTEST_PRIVATE_JWK
+# Optional for ledger mode:
+# [[d1_databases]]
+# binding = "ATTEST_DB"
+# database_name = "bansou-attest"
+# database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
