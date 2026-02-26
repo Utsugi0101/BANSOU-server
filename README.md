@@ -2,6 +2,11 @@
 
 Cloudflare Workers + Hono で動く最小の中央署名サーバです。VSCode拡張からのリクエストに対して署名付きJWTを発行し、JWKSを公開します。
 
+## 公開先
+
+- Production URL: https://bansou-server.soraki0101.workers.dev
+- Health check: https://bansou-server.soraki0101.workers.dev/gate/health
+
 ## セットアップ
 
 ```sh
