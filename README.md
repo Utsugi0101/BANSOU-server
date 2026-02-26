@@ -35,7 +35,21 @@ wrangler deploy
 
 ```sh
 wrangler secret put ATTEST_PRIVATE_JWK
+wrangler secret put GATE_API_TOKEN
 ```
+
+## D1 (ledger mode)
+
+PRにJWTをコミットしない運用では、サーバーに証明を保存するためにD1を使います。
+
+1. D1 DBを作成
+```sh
+wrangler d1 create bansou-attest
+```
+
+2. `wrangler.toml` に `d1_databases` バインドを追加（`binding = "ATTEST_DB"`）
+
+3. `quiz/submit` 成功時に ledger に保存され、`gate/evaluate` で照会できます。
 
 ## 動作確認
 
@@ -104,6 +118,7 @@ curl -X POST http://localhost:8787/quiz/submit \
 - `GET /policy`
 - `POST /quiz/generate`
 - `POST /quiz/submit`
+- `POST /gate/evaluate`
 - `POST /attestations/issue`
 
 ## 環境変数
@@ -112,4 +127,6 @@ curl -X POST http://localhost:8787/quiz/submit \
 - `ATTEST_PUBLIC_JWK` (公開鍵 JWK)
 - `ATTEST_PRIVATE_JWK` (秘密鍵 JWK / secret)
 - `OPENAI_API_KEY` (任意。設定時はOpenAIでクイズ生成、未設定時はテンプレクイズ)
+- `ATTEST_DB` (D1 binding。ledger modeで必須)
+- `GATE_API_TOKEN` (任意。`/gate/evaluate` のBearer token)
 - `POLICY_JSON` (任意)

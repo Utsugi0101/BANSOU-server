@@ -8,6 +8,8 @@ interface Env {
   ATTEST_PRIVATE_JWK: string;
   ATTEST_PUBLIC_JWK: string;
   OPENAI_API_KEY?: string;
+  GATE_API_TOKEN?: string;
+  ATTEST_DB?: D1Database;
   POLICY_JSON?: string;
 }
 
@@ -92,6 +94,14 @@ const quizSubmitSchema = z.object({
   quiz_session_token: z.string().min(1),
   answers: z.array(z.number().int().min(0).max(3)),
   duration_ms: z.number().int().min(0).optional(),
+});
+
+const gateEvaluateSchema = z.object({
+  repo: z.string().regex(/^[^/]+\/[^/]+$/),
+  commit: z.string().regex(/^[0-9a-f]{40}$/),
+  sub: z.string().min(1),
+  required_quiz_id: z.string().min(1),
+  changed_files: z.array(z.string().min(1)),
 });
 
 function isJwk(value: unknown): value is JWK {
@@ -317,6 +327,102 @@ async function issueAttestationJwt(env: Env, payload: z.infer<typeof attestation
   return { token, exp };
 }
 
+function normalizePath(input: string): string {
+  return input.replace(/\\/g, '/').replace(/^\.\/+/, '');
+}
+
+function isEssentialFile(filePath: string): boolean {
+  const file = normalizePath(filePath);
+  if (file.startsWith('.bansou/')) return false;
+  if (file.startsWith('.github/')) return false;
+  if (/\.(md|markdown|json|ya?ml|toml|ini|cfg|lock)$/i.test(file)) return false;
+  return true;
+}
+
+function requireGateTokenOrSkip(c: any): Response | undefined {
+  const expected = c.env.GATE_API_TOKEN;
+  if (!expected) {
+    return undefined;
+  }
+  const auth = c.req.header('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!token || token !== expected) {
+    return jsonError(c, 401, 'unauthorized', 'Invalid gate token');
+  }
+  return undefined;
+}
+
+async function ensureLedgerSchema(db: D1Database): Promise<void> {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS attestations_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo TEXT NOT NULL,
+      commit TEXT NOT NULL,
+      sub TEXT NOT NULL,
+      quiz_id TEXT NOT NULL,
+      quiz_version TEXT NOT NULL,
+      artifact_path TEXT NOT NULL,
+      range_start INTEGER,
+      range_end INTEGER,
+      score INTEGER NOT NULL,
+      questions_hash TEXT,
+      answers_hash TEXT,
+      diff_hash TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(repo, commit, sub, quiz_id, artifact_path, IFNULL(range_start, -1), IFNULL(range_end, -1))
+    );
+  `);
+}
+
+async function upsertLedgerRecord(
+  db: D1Database,
+  record: {
+    repo: string;
+    commit: string;
+    sub: string;
+    quizId: string;
+    quizVersion: string;
+    artifactPath: string;
+    rangeStart?: number;
+    rangeEnd?: number;
+    score: number;
+    questionsHash?: string;
+    answersHash?: string;
+    diffHash?: string;
+  }
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO attestations_ledger (
+        repo, commit, sub, quiz_id, quiz_version, artifact_path, range_start, range_end, score,
+        questions_hash, answers_hash, diff_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(repo, commit, sub, quiz_id, artifact_path, IFNULL(range_start, -1), IFNULL(range_end, -1))
+      DO UPDATE SET
+        score=excluded.score,
+        questions_hash=excluded.questions_hash,
+        answers_hash=excluded.answers_hash,
+        diff_hash=excluded.diff_hash,
+        created_at=excluded.created_at`
+    )
+    .bind(
+      record.repo,
+      record.commit,
+      record.sub,
+      record.quizId,
+      record.quizVersion,
+      normalizePath(record.artifactPath),
+      record.rangeStart ?? null,
+      record.rangeEnd ?? null,
+      record.score,
+      record.questionsHash ?? null,
+      record.answersHash ?? null,
+      record.diffHash ?? null,
+      new Date().toISOString()
+    )
+    .run();
+}
+
 app.get('/.well-known/jwks.json', (c) => {
   const raw = c.env.ATTEST_PUBLIC_JWK;
   if (!raw) return jsonError(c, 500, 'server_error', 'ATTEST_PUBLIC_JWK is missing');
@@ -492,7 +598,11 @@ app.post('/quiz/submit', async (c) => {
   const answersHash = await computeAnswersHash(request.answers);
 
   const attestations: Array<{ artifact: Artifact; attestation_jwt: string; exp: number }> = [];
+  let ledgerSaved = false;
   if (passed) {
+    if (c.env.ATTEST_DB) {
+      await ensureLedgerSchema(c.env.ATTEST_DB);
+    }
     for (const artifact of session.artifacts) {
       const result = await issueAttestationJwt(c.env, {
         sub: subject,
@@ -512,6 +622,24 @@ app.post('/quiz/submit', async (c) => {
         attestation_jwt: result.token,
         exp: result.exp,
       });
+
+      if (c.env.ATTEST_DB) {
+        await upsertLedgerRecord(c.env.ATTEST_DB, {
+          repo: session.repo,
+          commit: session.commit,
+          sub: subject,
+          quizId: session.quiz_id,
+          quizVersion: session.quiz_version,
+          artifactPath: artifact.path,
+          rangeStart: artifact.rangeStart,
+          rangeEnd: artifact.rangeEnd,
+          score,
+          questionsHash: session.questions_hash,
+          answersHash,
+          diffHash: session.diff_hash,
+        });
+        ledgerSaved = true;
+      }
     }
   }
 
@@ -525,6 +653,79 @@ app.post('/quiz/submit', async (c) => {
     answers_hash: answersHash,
     diff_hash: session.diff_hash,
     attestations,
+    ledger_saved: ledgerSaved,
+  });
+});
+
+app.post('/gate/evaluate', async (c) => {
+  const unauthorized = requireGateTokenOrSkip(c);
+  if (unauthorized) {
+    return unauthorized;
+  }
+
+  if (!c.env.ATTEST_DB) {
+    return jsonError(c, 500, 'server_error', 'ATTEST_DB is not configured');
+  }
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return jsonError(c, 400, 'invalid_request', 'Invalid JSON body');
+  }
+
+  const parsed = gateEvaluateSchema.safeParse(body);
+  if (!parsed.success) {
+    return jsonError(c, 400, 'invalid_request', 'Request validation failed');
+  }
+
+  const request = parsed.data;
+  const requiredFiles = request.changed_files
+    .map((filePath) => normalizePath(filePath))
+    .filter((filePath) => isEssentialFile(filePath));
+
+  if (requiredFiles.length === 0) {
+    return c.json({
+      ok: true,
+      required_files: 0,
+      covered_files: 0,
+      missing_files: [],
+      mode: 'no-essential-files',
+    });
+  }
+
+  await ensureLedgerSchema(c.env.ATTEST_DB);
+
+  const placeholders = requiredFiles.map(() => '?').join(', ');
+  const query = `
+    SELECT DISTINCT artifact_path
+    FROM attestations_ledger
+    WHERE repo = ? AND commit = ? AND sub = ? AND quiz_id = ? AND artifact_path IN (${placeholders})
+  `;
+  const bindings: unknown[] = [
+    request.repo,
+    request.commit,
+    request.sub,
+    request.required_quiz_id,
+    ...requiredFiles,
+  ];
+
+  const rowsResult = await c.env.ATTEST_DB.prepare(query).bind(...bindings).all<{
+    artifact_path: string;
+  }>();
+  const covered = new Set(
+    (rowsResult.results || [])
+      .map((row) => normalizePath(row.artifact_path))
+      .filter(Boolean)
+  );
+  const missing = requiredFiles.filter((filePath) => !covered.has(filePath));
+
+  return c.json({
+    ok: missing.length === 0,
+    required_files: requiredFiles.length,
+    covered_files: covered.size,
+    missing_files: missing,
+    mode: 'commit-exact',
   });
 });
 
