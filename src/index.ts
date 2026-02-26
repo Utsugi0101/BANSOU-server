@@ -357,7 +357,7 @@ async function ensureLedgerSchema(db: D1Database): Promise<void> {
     CREATE TABLE IF NOT EXISTS attestations_ledger (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       repo TEXT NOT NULL,
-      commit TEXT NOT NULL,
+      commit_sha TEXT NOT NULL,
       sub TEXT NOT NULL,
       quiz_id TEXT NOT NULL,
       quiz_version TEXT NOT NULL,
@@ -369,7 +369,7 @@ async function ensureLedgerSchema(db: D1Database): Promise<void> {
       answers_hash TEXT,
       diff_hash TEXT,
       created_at TEXT NOT NULL,
-      UNIQUE(repo, commit, sub, quiz_id, artifact_path, range_start, range_end)
+      UNIQUE(repo, commit_sha, sub, quiz_id, artifact_path, range_start, range_end)
     );
   `);
 }
@@ -394,10 +394,10 @@ async function upsertLedgerRecord(
   await db
     .prepare(
       `INSERT INTO attestations_ledger (
-        repo, commit, sub, quiz_id, quiz_version, artifact_path, range_start, range_end, score,
+        repo, commit_sha, sub, quiz_id, quiz_version, artifact_path, range_start, range_end, score,
         questions_hash, answers_hash, diff_hash, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(repo, commit, sub, quiz_id, artifact_path, range_start, range_end)
+      ON CONFLICT(repo, commit_sha, sub, quiz_id, artifact_path, range_start, range_end)
       DO UPDATE SET
         score=excluded.score,
         questions_hash=excluded.questions_hash,
@@ -658,75 +658,80 @@ app.post('/quiz/submit', async (c) => {
 });
 
 app.post('/gate/evaluate', async (c) => {
-  const unauthorized = requireGateTokenOrSkip(c);
-  if (unauthorized) {
-    return unauthorized;
-  }
-
-  if (!c.env.ATTEST_DB) {
-    return jsonError(c, 500, 'server_error', 'ATTEST_DB is not configured');
-  }
-
-  let body: unknown;
   try {
-    body = await c.req.json();
-  } catch {
-    return jsonError(c, 400, 'invalid_request', 'Invalid JSON body');
-  }
+    const unauthorized = requireGateTokenOrSkip(c);
+    if (unauthorized) {
+      return unauthorized;
+    }
 
-  const parsed = gateEvaluateSchema.safeParse(body);
-  if (!parsed.success) {
-    return jsonError(c, 400, 'invalid_request', 'Request validation failed');
-  }
+    if (!c.env.ATTEST_DB) {
+      return jsonError(c, 500, 'server_error', 'ATTEST_DB is not configured');
+    }
 
-  const request = parsed.data;
-  const requiredFiles = request.changed_files
-    .map((filePath) => normalizePath(filePath))
-    .filter((filePath) => isEssentialFile(filePath));
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return jsonError(c, 400, 'invalid_request', 'Invalid JSON body');
+    }
 
-  if (requiredFiles.length === 0) {
+    const parsed = gateEvaluateSchema.safeParse(body);
+    if (!parsed.success) {
+      return jsonError(c, 400, 'invalid_request', 'Request validation failed');
+    }
+
+    const request = parsed.data;
+    const requiredFiles = request.changed_files
+      .map((filePath) => normalizePath(filePath))
+      .filter((filePath) => isEssentialFile(filePath));
+
+    if (requiredFiles.length === 0) {
+      return c.json({
+        ok: true,
+        required_files: 0,
+        covered_files: 0,
+        missing_files: [],
+        mode: 'no-essential-files',
+      });
+    }
+
+    await ensureLedgerSchema(c.env.ATTEST_DB);
+
+    const placeholders = requiredFiles.map(() => '?').join(', ');
+    const query = `
+      SELECT DISTINCT artifact_path
+      FROM attestations_ledger
+      WHERE repo = ? AND commit_sha = ? AND sub = ? AND quiz_id = ? AND artifact_path IN (${placeholders})
+    `;
+    const bindings: unknown[] = [
+      request.repo,
+      request.commit,
+      request.sub,
+      request.required_quiz_id,
+      ...requiredFiles,
+    ];
+
+    const rowsResult = await c.env.ATTEST_DB.prepare(query).bind(...bindings).all<{
+      artifact_path: string;
+    }>();
+    const covered = new Set(
+      (rowsResult.results || [])
+        .map((row) => normalizePath(row.artifact_path))
+        .filter(Boolean)
+    );
+    const missing = requiredFiles.filter((filePath) => !covered.has(filePath));
+
     return c.json({
-      ok: true,
-      required_files: 0,
-      covered_files: 0,
-      missing_files: [],
-      mode: 'no-essential-files',
+      ok: missing.length === 0,
+      required_files: requiredFiles.length,
+      covered_files: covered.size,
+      missing_files: missing,
+      mode: 'commit-exact',
     });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return jsonError(c, 500, 'server_error', `gate evaluate crashed: ${message}`);
   }
-
-  await ensureLedgerSchema(c.env.ATTEST_DB);
-
-  const placeholders = requiredFiles.map(() => '?').join(', ');
-  const query = `
-    SELECT DISTINCT artifact_path
-    FROM attestations_ledger
-    WHERE repo = ? AND commit = ? AND sub = ? AND quiz_id = ? AND artifact_path IN (${placeholders})
-  `;
-  const bindings: unknown[] = [
-    request.repo,
-    request.commit,
-    request.sub,
-    request.required_quiz_id,
-    ...requiredFiles,
-  ];
-
-  const rowsResult = await c.env.ATTEST_DB.prepare(query).bind(...bindings).all<{
-    artifact_path: string;
-  }>();
-  const covered = new Set(
-    (rowsResult.results || [])
-      .map((row) => normalizePath(row.artifact_path))
-      .filter(Boolean)
-  );
-  const missing = requiredFiles.filter((filePath) => !covered.has(filePath));
-
-  return c.json({
-    ok: missing.length === 0,
-    required_files: requiredFiles.length,
-    covered_files: covered.size,
-    missing_files: missing,
-    mode: 'commit-exact',
-  });
 });
 
 app.post('/attestations/issue', async (c) => {
