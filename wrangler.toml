@@ -1,6 +1,7 @@
 name = "bansou-server"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
+account_id = "4252cf502fa67347453cc20679b9c065"
 
 [vars]
 # Public values can live here.
@@ -12,7 +13,7 @@ POLICY_JSON = "{}"
 # Store ATTEST_PRIVATE_JWK as a secret:
 #   wrangler secret put ATTEST_PRIVATE_JWK
 # Optional for ledger mode:
-# [[d1_databases]]
-# binding = "ATTEST_DB"
-# database_name = "bansou-attest"
-# database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+[[d1_databases]]
+binding = "ATTEST_DB"
+database_name = "bansou-attest"
+database_id = "8aa10d99-75ca-4701-9f06-e2eb22b3724e"
