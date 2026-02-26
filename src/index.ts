@@ -1,22 +1,54 @@
-import { Hono } from "hono";
-import { z } from "zod";
-import { importJWK, SignJWT } from "jose";
-import type { JWK } from "jose";
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { importJWK, jwtVerify, SignJWT } from 'jose';
+import type { JWK, JWTPayload } from 'jose';
 
 interface Env {
   ISSUER: string;
   ATTEST_PRIVATE_JWK: string;
   ATTEST_PUBLIC_JWK: string;
+  OPENAI_API_KEY?: string;
   POLICY_JSON?: string;
 }
 
-const KID = "bansou-key-1";
-const ALLOWED_ALG = "EdDSA";
+const KID = 'bansou-key-1';
+const ALLOWED_ALG = 'EdDSA';
 const THIRTY_DAYS_SEC = 30 * 24 * 60 * 60;
+const QUIZ_SESSION_TTL_SEC = 30 * 60;
+const MIN_SCORE = 80;
+const MIN_DURATION_MS = 3000;
+type JoseKey = Awaited<ReturnType<typeof importJWK>>;
 
 const app = new Hono<{ Bindings: Env }>();
 
-// NOTE: CORS can be added later if needed.
+type Artifact = {
+  path: string;
+  rangeStart?: number;
+  rangeEnd?: number;
+};
+
+type QuizQuestionInternal = {
+  filePath: string;
+  question: string;
+  options: [string, string, string, string];
+  answerIndex: number;
+  rationale: string;
+  hunkSummary: string;
+};
+
+type QuizQuestionPublic = Omit<QuizQuestionInternal, 'answerIndex'>;
+
+type QuizSessionPayload = {
+  repo: string;
+  commit: string;
+  quiz_id: string;
+  quiz_version: string;
+  questions: QuizQuestionInternal[];
+  artifacts: Artifact[];
+  questions_hash: string;
+  diff_hash: string;
+  nonce: string;
+};
 
 const attestationSchema = z.object({
   sub: z.string().min(1),
@@ -25,98 +57,240 @@ const attestationSchema = z.object({
   artifact: z.object({
     path: z.string().min(1),
     rangeStart: z.number().int().optional(),
-    rangeEnd: z.number().int().optional()
+    rangeEnd: z.number().int().optional(),
   }),
   quiz_id: z.string().min(1),
   quiz_version: z.string().min(1),
   score: z.number().int().optional(),
   duration_ms: z.number().int().optional(),
   questions_hash: z.string().optional(),
-  answers_hash: z.string().optional()
+  answers_hash: z.string().optional(),
+  diff_hash: z.string().optional(),
+});
+
+const quizGenerateSchema = z.object({
+  sub: z.string().min(1),
+  repo: z.string().regex(/^[^/]+\/[^/]+$/),
+  commit: z.string().regex(/^[0-9a-f]{40}$/),
+  quiz_id: z.string().default('core-pr'),
+  quiz_version: z.string().default('1.0.0'),
+  files: z.array(z.string().min(1)).min(1),
+  diffsByFile: z.record(z.string()),
+  desiredQuestionCount: z.number().int().min(1).max(20).optional(),
+  artifacts: z
+    .array(
+      z.object({
+        path: z.string().min(1),
+        rangeStart: z.number().int().optional(),
+        rangeEnd: z.number().int().optional(),
+      })
+    )
+    .optional(),
+});
+
+const quizSubmitSchema = z.object({
+  quiz_session_token: z.string().min(1),
+  answers: z.array(z.number().int().min(0).max(3)),
+  duration_ms: z.number().int().min(0).optional(),
 });
 
 function isJwk(value: unknown): value is JWK {
-  if (typeof value !== "object" || value === null) return false;
+  if (typeof value !== 'object' || value === null) return false;
   const record = value as Record<string, unknown>;
-  return typeof record.kty === "string";
+  return typeof record.kty === 'string';
 }
 
 function jsonError(c: any, status: number, code: string, message: string) {
   return c.json({ error: code, error_description: message }, status);
 }
 
-app.get("/.well-known/jwks.json", (c) => {
-  const raw = c.env.ATTEST_PUBLIC_JWK;
-  if (!raw) return jsonError(c, 500, "server_error", "ATTEST_PUBLIC_JWK is missing");
-  let jwk: JWK;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!isJwk(parsed)) {
-      return jsonError(c, 500, "server_error", "ATTEST_PUBLIC_JWK is missing required fields");
-    }
-    jwk = parsed;
-  } catch {
-    return jsonError(c, 500, "server_error", "ATTEST_PUBLIC_JWK is invalid JSON");
+function normalizeText(input: string): string {
+  return input.replace(/\r\n/g, '\n');
+}
+
+async function sha256Base64Url(input: string): Promise<string> {
+  const encoded = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest('SHA-256', encoded);
+  const bytes = Array.from(new Uint8Array(digest));
+  const base64 = btoa(String.fromCharCode(...bytes));
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function computeDiffHash(diffsByFile: Record<string, string>): Promise<string> {
+  const payload = Object.keys(diffsByFile)
+    .sort()
+    .map((filePath) => `${filePath}\n${normalizeText(diffsByFile[filePath] ?? '')}`)
+    .join('\n');
+  return sha256Base64Url(payload);
+}
+
+async function computeQuestionsHash(questions: QuizQuestionInternal[]): Promise<string> {
+  return sha256BaseUrlFromJson(questions);
+}
+
+async function computeAnswersHash(answers: number[]): Promise<string> {
+  return sha256BaseUrlFromJson(answers);
+}
+
+async function sha256BaseUrlFromJson(value: unknown): Promise<string> {
+  return sha256Base64Url(JSON.stringify(value));
+}
+
+function summarizeDiff(diff: string): string {
+  const lines = normalizeText(diff).split('\n');
+  const added = lines.filter((line) => line.startsWith('+') && !line.startsWith('+++')).length;
+  const removed = lines.filter((line) => line.startsWith('-') && !line.startsWith('---')).length;
+  return `added:${added}, removed:${removed}`;
+}
+
+function buildTemplateQuestions(files: string[], diffsByFile: Record<string, string>, desiredCount: number): QuizQuestionInternal[] {
+  const targets = files.slice(0, Math.max(1, desiredCount));
+  return targets.map((filePath) => {
+    const diff = diffsByFile[filePath] ?? '';
+    const hunkSummary = summarizeDiff(diff);
+    return {
+      filePath,
+      question: `${filePath} の変更レビューで最も重要な確認はどれですか？`,
+      options: [
+        '変更意図・挙動・影響範囲を具体的に説明できること',
+        'ファイル名と雰囲気だけ把握すること',
+        'テストせずそのままマージすること',
+        'レビューコメントを後で読むこと',
+      ],
+      answerIndex: 0,
+      rationale: '変更の理解を証明するには、意図・挙動・影響範囲を説明可能であることが必要です。',
+      hunkSummary,
+    };
+  });
+}
+
+async function generateQuizQuestionsWithOpenAI(
+  apiKey: string,
+  files: string[],
+  diffsByFile: Record<string, string>,
+  desiredQuestionCount: number
+): Promise<QuizQuestionInternal[]> {
+  const systemPrompt =
+    'あなたはgit diffに対する理解確認クイズを作成します。JSONのみ返し、説明文を外に出さないでください。';
+  const userPrompt = [
+    `desiredQuestionCount=${desiredQuestionCount}`,
+    'rules:',
+    '- 選択肢4つ',
+    '- answerIndexは0-3',
+    '- すべて日本語',
+    '- filePathは与えられたfilesのいずれか',
+    'files:',
+    ...files,
+    'diffs:',
+    ...files.map((filePath) => `FILE:${filePath}\n${diffsByFile[filePath] ?? ''}`),
+  ].join('\n');
+
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-5-mini',
+      input: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'server_quiz_schema',
+          strict: true,
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['questions'],
+            properties: {
+              questions: {
+                type: 'array',
+                minItems: 1,
+                maxItems: 20,
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['filePath', 'question', 'options', 'answerIndex', 'rationale', 'hunkSummary'],
+                  properties: {
+                    filePath: { type: 'string' },
+                    question: { type: 'string' },
+                    options: {
+                      type: 'array',
+                      minItems: 4,
+                      maxItems: 4,
+                      items: { type: 'string' },
+                    },
+                    answerIndex: { type: 'integer', minimum: 0, maximum: 3 },
+                    rationale: { type: 'string' },
+                    hunkSummary: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenAI API error: ${response.status}`);
   }
 
-  if (!jwk.kid) jwk.kid = KID;
-  return c.json({ keys: [jwk] });
-});
-
-app.get("/policy", (c) => {
-  const raw = c.env.POLICY_JSON;
-  if (!raw) return c.json({});
-  try {
-    return c.json(JSON.parse(raw));
-  } catch {
-    return c.json({});
-  }
-});
-
-app.post("/attestations/issue", async (c) => {
-  let body: unknown;
-  try {
-    body = await c.req.json();
-  } catch {
-    return jsonError(c, 400, "invalid_request", "Invalid JSON body");
+  const data = (await response.json()) as { output_text?: string };
+  const output = data.output_text?.trim();
+  if (!output) {
+    throw new Error('OpenAI response was empty');
   }
 
-  const parsed = attestationSchema.safeParse(body);
-  if (!parsed.success) {
-    return jsonError(c, 400, "invalid_request", "Request validation failed");
+  const parsed = JSON.parse(output) as { questions: QuizQuestionInternal[] };
+  return parsed.questions;
+}
+
+async function getPrivateKey(env: Env): Promise<JoseKey> {
+  const privateJwkRaw = env.ATTEST_PRIVATE_JWK;
+  if (!privateJwkRaw) {
+    throw new Error('ATTEST_PRIVATE_JWK is missing');
+  }
+  const parsed = JSON.parse(privateJwkRaw);
+  if (!isJwk(parsed)) {
+    throw new Error('ATTEST_PRIVATE_JWK is missing required fields');
+  }
+  return importJWK(parsed, ALLOWED_ALG);
+}
+
+async function getPublicKey(env: Env): Promise<JoseKey> {
+  const publicJwkRaw = env.ATTEST_PUBLIC_JWK;
+  if (!publicJwkRaw) {
+    throw new Error('ATTEST_PUBLIC_JWK is missing');
+  }
+  const parsed = JSON.parse(publicJwkRaw);
+  if (!isJwk(parsed)) {
+    throw new Error('ATTEST_PUBLIC_JWK is missing required fields');
+  }
+  return importJWK(parsed, ALLOWED_ALG);
+}
+
+async function issueAttestationJwt(env: Env, payload: z.infer<typeof attestationSchema>): Promise<{ token: string; exp: number }> {
+  if (payload.score !== undefined && payload.score < MIN_SCORE) {
+    throw new Error('Score is below required minimum');
+  }
+  if (payload.duration_ms !== undefined && payload.duration_ms < MIN_DURATION_MS) {
+    throw new Error('Duration is below required minimum');
   }
 
-  const payload = parsed.data;
-
-  if (payload.score !== undefined && payload.score < 80) {
-    return jsonError(c, 403, "forbidden", "Score is below required minimum");
-  }
-  if (payload.duration_ms !== undefined && payload.duration_ms < 3000) {
-    return jsonError(c, 403, "forbidden", "Duration is below required minimum");
+  const issuer = env.ISSUER;
+  if (!issuer) {
+    throw new Error('ISSUER is missing');
   }
 
-  const issuer = c.env.ISSUER;
-  if (!issuer) return jsonError(c, 500, "server_error", "ISSUER is missing");
-
-  const privateJwkRaw = c.env.ATTEST_PRIVATE_JWK;
-  if (!privateJwkRaw) return jsonError(c, 500, "server_error", "ATTEST_PRIVATE_JWK is missing");
-
-  let privateJwk: JWK;
-  try {
-    const parsed = JSON.parse(privateJwkRaw);
-    if (!isJwk(parsed)) {
-      return jsonError(c, 500, "server_error", "ATTEST_PRIVATE_JWK is missing required fields");
-    }
-    privateJwk = parsed;
-  } catch {
-    return jsonError(c, 500, "server_error", "ATTEST_PRIVATE_JWK is invalid JSON");
-  }
-
-  const key = await importJWK(privateJwk, ALLOWED_ALG);
-
+  const key = await getPrivateKey(env);
   const now = Math.floor(Date.now() / 1000);
   const exp = now + THIRTY_DAYS_SEC;
-  const nonce = crypto.randomUUID();
 
   const jwtPayload = {
     repo: payload.repo,
@@ -128,10 +302,11 @@ app.post("/attestations/issue", async (c) => {
     duration_ms: payload.duration_ms ?? null,
     questions_hash: payload.questions_hash ?? null,
     answers_hash: payload.answers_hash ?? null,
-    nonce
+    diff_hash: payload.diff_hash ?? null,
+    nonce: crypto.randomUUID(),
   };
 
-  const attestationJwt = await new SignJWT(jwtPayload)
+  const token = await new SignJWT(jwtPayload)
     .setProtectedHeader({ alg: ALLOWED_ALG, kid: KID })
     .setIssuer(issuer)
     .setSubject(payload.sub)
@@ -139,12 +314,251 @@ app.post("/attestations/issue", async (c) => {
     .setExpirationTime(exp)
     .sign(key);
 
+  return { token, exp };
+}
+
+app.get('/.well-known/jwks.json', (c) => {
+  const raw = c.env.ATTEST_PUBLIC_JWK;
+  if (!raw) return jsonError(c, 500, 'server_error', 'ATTEST_PUBLIC_JWK is missing');
+  let jwk: JWK;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isJwk(parsed)) {
+      return jsonError(c, 500, 'server_error', 'ATTEST_PUBLIC_JWK is missing required fields');
+    }
+    jwk = parsed;
+  } catch {
+    return jsonError(c, 500, 'server_error', 'ATTEST_PUBLIC_JWK is invalid JSON');
+  }
+
+  if (!jwk.kid) jwk.kid = KID;
+  return c.json({ keys: [jwk] });
+});
+
+app.get('/policy', (c) => {
+  const raw = c.env.POLICY_JSON;
+  if (!raw) return c.json({});
+  try {
+    return c.json(JSON.parse(raw));
+  } catch {
+    return c.json({});
+  }
+});
+
+app.post('/quiz/generate', async (c) => {
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return jsonError(c, 400, 'invalid_request', 'Invalid JSON body');
+  }
+
+  const parsed = quizGenerateSchema.safeParse(body);
+  if (!parsed.success) {
+    return jsonError(c, 400, 'invalid_request', 'Request validation failed');
+  }
+
+  const request = parsed.data;
+  const desiredCount = request.desiredQuestionCount ?? Math.min(8, Math.max(3, request.files.length));
+
+  let questions: QuizQuestionInternal[];
+  try {
+    if (c.env.OPENAI_API_KEY) {
+      questions = await generateQuizQuestionsWithOpenAI(
+        c.env.OPENAI_API_KEY,
+        request.files,
+        request.diffsByFile,
+        desiredCount
+      );
+    } else {
+      questions = buildTemplateQuestions(request.files, request.diffsByFile, desiredCount);
+    }
+  } catch {
+    questions = buildTemplateQuestions(request.files, request.diffsByFile, desiredCount);
+  }
+
+  const boundedQuestions = questions.slice(0, desiredCount);
+  const publicQuestions: QuizQuestionPublic[] = boundedQuestions.map((question) => ({
+    filePath: question.filePath,
+    question: question.question,
+    options: question.options,
+    rationale: question.rationale,
+    hunkSummary: question.hunkSummary,
+  }));
+
+  const artifacts = request.artifacts ?? request.files.map((path) => ({ path }));
+  const questionsHash = await computeQuestionsHash(boundedQuestions);
+  const diffHash = await computeDiffHash(request.diffsByFile);
+
+  const sessionPayload: QuizSessionPayload = {
+    repo: request.repo,
+    commit: request.commit,
+    quiz_id: request.quiz_id,
+    quiz_version: request.quiz_version,
+    questions: boundedQuestions,
+    artifacts,
+    questions_hash: questionsHash,
+    diff_hash: diffHash,
+    nonce: crypto.randomUUID(),
+  };
+
+  const issuer = c.env.ISSUER;
+  if (!issuer) {
+    return jsonError(c, 500, 'server_error', 'ISSUER is missing');
+  }
+
+  const key = await getPrivateKey(c.env);
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + QUIZ_SESSION_TTL_SEC;
+  const quizSessionToken = await new SignJWT(sessionPayload as unknown as JWTPayload)
+    .setProtectedHeader({ alg: ALLOWED_ALG, kid: KID })
+    .setIssuer(issuer)
+    .setSubject(request.sub)
+    .setAudience('bansou-quiz-session')
+    .setIssuedAt(now)
+    .setExpirationTime(exp)
+    .sign(key);
+
   return c.json({
-    attestation_jwt: attestationJwt,
-    commit: payload.commit,
-    quiz_id: payload.quiz_id,
-    exp
+    quiz_id: request.quiz_id,
+    quiz_version: request.quiz_version,
+    questions_hash: questionsHash,
+    diff_hash: diffHash,
+    quiz: {
+      title: `Quiz for ${request.commit.slice(0, 8)}`,
+      questions: publicQuestions,
+    },
+    quiz_session_token: quizSessionToken,
+    exp,
   });
+});
+
+app.post('/quiz/submit', async (c) => {
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return jsonError(c, 400, 'invalid_request', 'Invalid JSON body');
+  }
+
+  const parsed = quizSubmitSchema.safeParse(body);
+  if (!parsed.success) {
+    return jsonError(c, 400, 'invalid_request', 'Request validation failed');
+  }
+
+  const request = parsed.data;
+  const issuer = c.env.ISSUER;
+  if (!issuer) {
+    return jsonError(c, 500, 'server_error', 'ISSUER is missing');
+  }
+
+  let payload: JWTPayload;
+  try {
+    const publicKey = await getPublicKey(c.env);
+    const verified = await jwtVerify(request.quiz_session_token, publicKey, {
+      issuer,
+      audience: 'bansou-quiz-session',
+    });
+    payload = verified.payload;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return jsonError(c, 401, 'invalid_token', message);
+  }
+
+  const session = payload as unknown as QuizSessionPayload;
+  const subject = payload.sub;
+  if (!subject) {
+    return jsonError(c, 400, 'invalid_token', 'quiz session token missing sub');
+  }
+
+  if (!Array.isArray(session.questions) || session.questions.length === 0) {
+    return jsonError(c, 400, 'invalid_token', 'quiz session token missing questions');
+  }
+
+  if (request.answers.length !== session.questions.length) {
+    return jsonError(c, 400, 'invalid_request', 'answer count mismatch');
+  }
+
+  let correct = 0;
+  for (let index = 0; index < session.questions.length; index += 1) {
+    if (request.answers[index] === session.questions[index].answerIndex) {
+      correct += 1;
+    }
+  }
+
+  const total = session.questions.length;
+  const score = total === 0 ? 0 : Math.round((correct / total) * 100);
+  const passed = score >= MIN_SCORE;
+  const answersHash = await computeAnswersHash(request.answers);
+
+  const attestations: Array<{ artifact: Artifact; attestation_jwt: string; exp: number }> = [];
+  if (passed) {
+    for (const artifact of session.artifacts) {
+      const result = await issueAttestationJwt(c.env, {
+        sub: subject,
+        repo: session.repo,
+        commit: session.commit,
+        artifact,
+        quiz_id: session.quiz_id,
+        quiz_version: session.quiz_version,
+        score,
+        duration_ms: request.duration_ms,
+        questions_hash: session.questions_hash,
+        answers_hash: answersHash,
+        diff_hash: session.diff_hash,
+      });
+      attestations.push({
+        artifact,
+        attestation_jwt: result.token,
+        exp: result.exp,
+      });
+    }
+  }
+
+  return c.json({
+    score,
+    correct,
+    total,
+    passed,
+    min_score: MIN_SCORE,
+    questions_hash: session.questions_hash,
+    answers_hash: answersHash,
+    diff_hash: session.diff_hash,
+    attestations,
+  });
+});
+
+app.post('/attestations/issue', async (c) => {
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return jsonError(c, 400, 'invalid_request', 'Invalid JSON body');
+  }
+
+  const parsed = attestationSchema.safeParse(body);
+  if (!parsed.success) {
+    return jsonError(c, 400, 'invalid_request', 'Request validation failed');
+  }
+
+  try {
+    const result = await issueAttestationJwt(c.env, parsed.data);
+    return c.json({
+      attestation_jwt: result.token,
+      commit: parsed.data.commit,
+      quiz_id: parsed.data.quiz_id,
+      exp: result.exp,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('Score is below required minimum')) {
+      return jsonError(c, 403, 'forbidden', message);
+    }
+    if (message.includes('Duration is below required minimum')) {
+      return jsonError(c, 403, 'forbidden', message);
+    }
+    return jsonError(c, 500, 'server_error', message);
+  }
 });
 
 export default app;

@@ -64,6 +64,35 @@ curl -X POST http://localhost:8787/attestations/issue \
   }'
 ```
 
+### クイズ生成 (server-side)
+
+```sh
+curl -X POST http://localhost:8787/quiz/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sub": "github_login",
+    "repo": "owner/name",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "quiz_id": "core-pr",
+    "quiz_version": "1.0.0",
+    "files": ["src/foo.ts"],
+    "diffsByFile": {
+      "src/foo.ts": "diff --git a/src/foo.ts b/src/foo.ts\n@@ -1,2 +1,2 @@\n-const a = 1\n+const a = 2"
+    }
+  }'
+```
+
+### クイズ提出 (server-side採点 + JWT発行)
+
+```sh
+curl -X POST http://localhost:8787/quiz/submit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "quiz_session_token": "<from /quiz/generate>",
+    "answers": [0]
+  }'
+```
+
 ## GitHub Actions で検証する際の情報
 
 - ISSUER: `https://attest.example.com`
@@ -73,6 +102,8 @@ curl -X POST http://localhost:8787/attestations/issue \
 
 - `GET /.well-known/jwks.json`
 - `GET /policy`
+- `POST /quiz/generate`
+- `POST /quiz/submit`
 - `POST /attestations/issue`
 
 ## 環境変数
@@ -80,4 +111,5 @@ curl -X POST http://localhost:8787/attestations/issue \
 - `ISSUER` (例: `https://attest.example.com`)
 - `ATTEST_PUBLIC_JWK` (公開鍵 JWK)
 - `ATTEST_PRIVATE_JWK` (秘密鍵 JWK / secret)
+- `OPENAI_API_KEY` (任意。設定時はOpenAIでクイズ生成、未設定時はテンプレクイズ)
 - `POLICY_JSON` (任意)
