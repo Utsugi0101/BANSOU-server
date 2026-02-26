@@ -335,6 +335,7 @@ function isEssentialFile(filePath: string): boolean {
   const file = normalizePath(filePath);
   if (file.startsWith('.bansou/')) return false;
   if (file.startsWith('.github/')) return false;
+  if (file.startsWith('scripts/')) return false;
   if (/\.(md|markdown|json|ya?ml|toml|ini|cfg|lock)$/i.test(file)) return false;
   return true;
 }
