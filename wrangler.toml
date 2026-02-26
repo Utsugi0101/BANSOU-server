@@ -5,7 +5,7 @@ compatibility_date = "2025-01-01"
 [vars]
 # Public values can live here.
 ISSUER = "https://bansou-server.soraki0101.workers.dev"
-ATTEST_PUBLIC_JWK = '{"kty":"OKP","crv":"Ed25519","x":"...","kid":"bansou-key-1"}'
+ATTEST_PUBLIC_JWK= '{"crv":"Ed25519","x":"hs3KNTtTLECqR4mVGOjcV0vx2SipFfqEErZ0kdD6tag","kty":"OKP","kid":"bansou-key-1"}'
 # Optional policy JSON
 POLICY_JSON = "{}"
 
