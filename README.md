@@ -107,6 +107,14 @@ curl -X POST http://localhost:8787/quiz/submit \
   }'
 ```
 
+### gate health (デプロイ診断)
+
+```sh
+curl http://localhost:8787/gate/health
+```
+
+本番でも `GET /gate/health` を叩くと、`ATTEST_DB` バインドと schema 初期化可否を確認できます。
+
 ## GitHub Actions で検証する際の情報
 
 - ISSUER: `https://attest.example.com`
@@ -119,6 +127,7 @@ curl -X POST http://localhost:8787/quiz/submit \
 - `POST /quiz/generate`
 - `POST /quiz/submit`
 - `POST /gate/evaluate`
+- `GET /gate/health`
 - `POST /attestations/issue`
 
 ## 環境変数

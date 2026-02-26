@@ -725,6 +725,39 @@ app.post('/gate/evaluate', async (c) => {
   }
 });
 
+app.get('/gate/health', async (c) => {
+  const hasDb = Boolean(c.env.ATTEST_DB);
+  const hasGateToken = Boolean(c.env.GATE_API_TOKEN);
+  const hasIssuer = Boolean(c.env.ISSUER);
+  const hasPublicJwk = Boolean(c.env.ATTEST_PUBLIC_JWK);
+  const hasPrivateJwk = Boolean(c.env.ATTEST_PRIVATE_JWK);
+  let dbReady = false;
+  let dbError: string | null = null;
+
+  if (c.env.ATTEST_DB) {
+    try {
+      await ensureLedgerSchema(c.env.ATTEST_DB);
+      dbReady = true;
+    } catch (error) {
+      dbError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  return c.json({
+    ok: hasDb && dbReady,
+    checks: {
+      has_issuer: hasIssuer,
+      has_public_jwk: hasPublicJwk,
+      has_private_jwk: hasPrivateJwk,
+      has_gate_api_token: hasGateToken,
+      has_attest_db: hasDb,
+      attest_db_ready: dbReady,
+    },
+    db_error: dbError,
+    now: new Date().toISOString(),
+  });
+});
+
 app.post('/attestations/issue', async (c) => {
   let body: unknown;
   try {
