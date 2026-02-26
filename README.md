@@ -31,6 +31,12 @@ wrangler dev
 wrangler deploy
 ```
 
+GitHub Actions からは `.github/workflows/deploy-worker.yml` を使ってデプロイできます。
+必要な Secrets:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+
 ## Secrets
 
 ```sh
