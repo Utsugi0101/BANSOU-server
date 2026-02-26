@@ -353,25 +353,16 @@ function requireGateTokenOrSkip(c: any): Response | undefined {
 }
 
 async function ensureLedgerSchema(db: D1Database): Promise<void> {
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS attestations_ledger (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      repo TEXT NOT NULL,
-      commit_sha TEXT NOT NULL,
-      sub TEXT NOT NULL,
-      quiz_id TEXT NOT NULL,
-      quiz_version TEXT NOT NULL,
-      artifact_path TEXT NOT NULL,
-      range_start INTEGER NOT NULL DEFAULT -1,
-      range_end INTEGER NOT NULL DEFAULT -1,
-      score INTEGER NOT NULL,
-      questions_hash TEXT,
-      answers_hash TEXT,
-      diff_hash TEXT,
-      created_at TEXT NOT NULL,
-      UNIQUE(repo, commit_sha, sub, quiz_id, artifact_path, range_start, range_end)
-    );
-  `);
+  await db
+    .prepare(
+      'CREATE TABLE IF NOT EXISTS attestations_ledger (id INTEGER PRIMARY KEY, repo TEXT NOT NULL, commit_sha TEXT NOT NULL, sub TEXT NOT NULL, quiz_id TEXT NOT NULL, quiz_version TEXT NOT NULL, artifact_path TEXT NOT NULL, range_start INTEGER NOT NULL DEFAULT -1, range_end INTEGER NOT NULL DEFAULT -1, score INTEGER NOT NULL, questions_hash TEXT, answers_hash TEXT, diff_hash TEXT, created_at TEXT NOT NULL)'
+    )
+    .run();
+  await db
+    .prepare(
+      'CREATE UNIQUE INDEX IF NOT EXISTS attestations_ledger_unique ON attestations_ledger (repo, commit_sha, sub, quiz_id, artifact_path, range_start, range_end)'
+    )
+    .run();
 }
 
 async function upsertLedgerRecord(
