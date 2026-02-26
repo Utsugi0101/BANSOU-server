@@ -362,14 +362,14 @@ async function ensureLedgerSchema(db: D1Database): Promise<void> {
       quiz_id TEXT NOT NULL,
       quiz_version TEXT NOT NULL,
       artifact_path TEXT NOT NULL,
-      range_start INTEGER,
-      range_end INTEGER,
+      range_start INTEGER NOT NULL DEFAULT -1,
+      range_end INTEGER NOT NULL DEFAULT -1,
       score INTEGER NOT NULL,
       questions_hash TEXT,
       answers_hash TEXT,
       diff_hash TEXT,
       created_at TEXT NOT NULL,
-      UNIQUE(repo, commit, sub, quiz_id, artifact_path, IFNULL(range_start, -1), IFNULL(range_end, -1))
+      UNIQUE(repo, commit, sub, quiz_id, artifact_path, range_start, range_end)
     );
   `);
 }
@@ -397,7 +397,7 @@ async function upsertLedgerRecord(
         repo, commit, sub, quiz_id, quiz_version, artifact_path, range_start, range_end, score,
         questions_hash, answers_hash, diff_hash, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(repo, commit, sub, quiz_id, artifact_path, IFNULL(range_start, -1), IFNULL(range_end, -1))
+      ON CONFLICT(repo, commit, sub, quiz_id, artifact_path, range_start, range_end)
       DO UPDATE SET
         score=excluded.score,
         questions_hash=excluded.questions_hash,
@@ -412,8 +412,8 @@ async function upsertLedgerRecord(
       record.quizId,
       record.quizVersion,
       normalizePath(record.artifactPath),
-      record.rangeStart ?? null,
-      record.rangeEnd ?? null,
+      record.rangeStart ?? -1,
+      record.rangeEnd ?? -1,
       record.score,
       record.questionsHash ?? null,
       record.answersHash ?? null,
