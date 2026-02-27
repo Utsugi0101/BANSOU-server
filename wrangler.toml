@@ -16,4 +16,4 @@ POLICY_JSON = "{}"
 [[d1_databases]]
 binding = "ATTEST_DB"
 database_name = "bansou-attest"
-database_id = "REPLACE_WITH_SORAKI_D1_DATABASE_ID"
+database_id = "c1ba1019-cf75-4ff5-9f53-80f6348121e4"

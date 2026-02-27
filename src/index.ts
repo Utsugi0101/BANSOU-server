@@ -153,25 +153,124 @@ function summarizeDiff(diff: string): string {
   return `added:${added}, removed:${removed}`;
 }
 
+function countChangedLines(diff: string): number {
+  return normalizeText(diff)
+    .split('\n')
+    .filter((line) => (line.startsWith('+') && !line.startsWith('+++')) || (line.startsWith('-') && !line.startsWith('---')))
+    .length;
+}
+
+function analyzeDiff(diff: string): {
+  changedLines: number;
+  hasThrow: boolean;
+  hasTryCatch: boolean;
+  hasAsync: boolean;
+  hasAuthLike: boolean;
+  hasInputLike: boolean;
+} {
+  const normalized = normalizeText(diff);
+  const changedLines = countChangedLines(normalized);
+  return {
+    changedLines,
+    hasThrow: /\bthrow\b/.test(normalized),
+    hasTryCatch: /\btry\b|\bcatch\b/.test(normalized),
+    hasAsync: /\basync\b|\bawait\b|\.then\(|Promise/.test(normalized),
+    hasAuthLike: /\bauth\b|\btoken\b|\bsecret\b|\bpassword\b|\bjwt\b/i.test(normalized),
+    hasInputLike: /\breq\b|\binput\b|\bbody\b|\bparams\b|\bquery\b/i.test(normalized),
+  };
+}
+
+function buildTemplateQuestionForCategory(
+  filePath: string,
+  hunkSummary: string,
+  info: ReturnType<typeof analyzeDiff>,
+  categoryIndex: number
+): QuizQuestionInternal {
+  const correctOption = '差分の挙動を具体化し、テスト観点まで説明できる状態';
+  const options: [string, string, string, string] = [
+    correctOption,
+    '差分をざっと見て雰囲気だけ把握した状態',
+    'レビュー後に読む前提で、まずマージする状態',
+    '変更理由を推測し、確認せずに進める状態',
+  ];
+
+  switch (categoryIndex % 5) {
+    case 0:
+      return {
+        filePath,
+        question: `${filePath} で「実行結果が変わる条件」を確認する際、最も優先すべきものはどれですか？`,
+        options,
+        answerIndex: 0,
+        rationale:
+          '実行結果予測は、入力条件・分岐・戻り値の変化を説明できることが前提です。期待値を言語化できる状態を目指します。',
+        hunkSummary,
+      };
+    case 1:
+      return {
+        filePath,
+        question: `${filePath} の例外/副作用確認として、最も適切なレビュー観点はどれですか？`,
+        options,
+        answerIndex: 0,
+        rationale:
+          info.hasThrow || info.hasTryCatch
+            ? 'この差分は例外処理の変更を含みます。失敗時の挙動と呼び出し側への影響を追跡する必要があります。'
+            : '副作用やエラー時挙動は変更点が小さくても壊れやすい部分です。成功系だけでなく失敗系まで確認します。',
+        hunkSummary,
+      };
+    case 2:
+      return {
+        filePath,
+        question: `${filePath} のセキュリティ観点で、最低限確認すべき内容はどれですか？`,
+        options,
+        answerIndex: 0,
+        rationale:
+          info.hasAuthLike || info.hasInputLike
+            ? '認証・入力境界に関する変更があるため、検証漏れや権限境界の破れを重点的に確認します。'
+            : '入力処理や権限判定に直結しない差分でも、公開面の挙動変化がないか確認が必要です。',
+        hunkSummary,
+      };
+    case 3:
+      return {
+        filePath,
+        question: `${filePath} の設計意図を確認するレビューとして、最も適切なのはどれですか？`,
+        options,
+        answerIndex: 0,
+        rationale:
+          info.changedLines > 40
+            ? '変更行が多く、局所最適の混入リスクが高いため、責務分離・依存方向・将来変更性を明示的に確認します。'
+            : '設計意図は実装詳細より先に確認すると、レビュー観点の抜け漏れを減らせます。',
+        hunkSummary,
+      };
+    default:
+      return {
+        filePath,
+        question: `${filePath} で回帰バグを減らすための確認として、最も妥当なのはどれですか？`,
+        options,
+        answerIndex: 0,
+        rationale:
+          info.hasAsync
+            ? '非同期処理の差分があるため、順序依存・タイミング依存の不具合を想定した確認が必要です。'
+            : '正常系だけでなく境界値・異常系・既存呼び出し元への影響を含めて確認することが有効です。',
+        hunkSummary,
+      };
+  }
+}
+
 function buildTemplateQuestions(files: string[], diffsByFile: Record<string, string>, desiredCount: number): QuizQuestionInternal[] {
-  const targets = files.slice(0, Math.max(1, desiredCount));
-  return targets.map((filePath) => {
+  if (files.length === 0) {
+    return [];
+  }
+
+  const count = Math.max(1, desiredCount);
+  const questions: QuizQuestionInternal[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const filePath = files[index % files.length];
     const diff = diffsByFile[filePath] ?? '';
     const hunkSummary = summarizeDiff(diff);
-    return {
-      filePath,
-      question: `${filePath} の変更レビューで最も重要な確認はどれですか？`,
-      options: [
-        '変更意図・挙動・影響範囲を具体的に説明できること',
-        'ファイル名と雰囲気だけ把握すること',
-        'テストせずそのままマージすること',
-        'レビューコメントを後で読むこと',
-      ],
-      answerIndex: 0,
-      rationale: '変更の理解を証明するには、意図・挙動・影響範囲を説明可能であることが必要です。',
-      hunkSummary,
-    };
-  });
+    const info = analyzeDiff(diff);
+    questions.push(buildTemplateQuestionForCategory(filePath, hunkSummary, info, index));
+  }
+  return questions;
 }
 
 async function generateQuizQuestionsWithOpenAI(
@@ -189,6 +288,8 @@ async function generateQuizQuestionsWithOpenAI(
     '- answerIndexは0-3',
     '- すべて日本語',
     '- filePathは与えられたfilesのいずれか',
+    '- 問題タイプを偏らせない（実行結果予測 / 例外・副作用 / セキュリティ / 設計意図 / バグ検出 を混ぜる）',
+    '- 正解選択肢の位置を固定しない（常に0番にしない）',
     'files:',
     ...files,
     'diffs:',
