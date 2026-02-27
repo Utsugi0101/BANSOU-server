@@ -1,13 +1,19 @@
 name = "bansou-server"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
+account_id = "61f174347340ea7c7d2b2b3feb226e2e"
 
 [vars]
 # Public values can live here.
 ISSUER = "https://bansou-server.soraki0101.workers.dev"
-ATTEST_PUBLIC_JWK = '{"kty":"OKP","crv":"Ed25519","x":"...","kid":"bansou-key-1"}'
+ATTEST_PUBLIC_JWK= '{"crv":"Ed25519","x":"hs3KNTtTLECqR4mVGOjcV0vx2SipFfqEErZ0kdD6tag","kty":"OKP","kid":"bansou-key-1"}'
 # Optional policy JSON
 POLICY_JSON = "{}"
 
 # Store ATTEST_PRIVATE_JWK as a secret:
 #   wrangler secret put ATTEST_PRIVATE_JWK
+# Optional for ledger mode:
+[[d1_databases]]
+binding = "ATTEST_DB"
+database_name = "bansou-attest"
+database_id = "c1ba1019-cf75-4ff5-9f53-80f6348121e4"
